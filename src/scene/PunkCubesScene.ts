@@ -5,6 +5,8 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import type { CodeNodeKind } from '../data/types';
+import { connectionRadius } from './connections';
+import { DOCK_SPRING, springSettled, stepSpring, type SpringScalar } from './motion';
 import type { LayoutCube, RepositoryLayout } from './types';
 
 const PALETTE = [0xb6ff4a, 0x68dfff, 0xff6b35, 0xff55c8, 0xffd166, 0x9f8cff];
@@ -37,6 +39,38 @@ interface CameraTween {
   toTarget: THREE.Vector3;
 }
 
+interface DockConnection {
+  parentId: string;
+  childId: string;
+  radius: number;
+  color: THREE.Color;
+}
+
+interface DragState {
+  pointerId: number;
+  rootId: string;
+  subtreeIds: string[];
+  plane: THREE.Plane;
+  grabOffset: THREE.Vector3;
+  rootHome: THREE.Vector3;
+  startClient: { x: number; y: number };
+  lastPoint: THREE.Vector3;
+  lastTime: number;
+  velocity: THREE.Vector3;
+  moved: boolean;
+}
+
+interface SettleState {
+  rootId: string;
+  subtreeIds: string[];
+  rootHome: THREE.Vector3;
+  position: THREE.Vector3;
+  velocity: THREE.Vector3;
+  tilt: THREE.Vector2;
+  tiltVelocity: THREE.Vector2;
+  flash: number;
+}
+
 function seededUnit(value: string): number {
   let hash = 2166136261;
   for (let index = 0; index < value.length; index += 1) {
@@ -60,6 +94,17 @@ export class PunkCubesScene {
   private readonly world = new THREE.Group();
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2(20, 20);
+  private readonly dragPoint = new THREE.Vector3();
+  private readonly cameraDirection = new THREE.Vector3();
+  private readonly identityQuaternion = new THREE.Quaternion();
+  private readonly connectionUp = new THREE.Vector3(0, 1, 0);
+  private readonly connectionDirection = new THREE.Vector3();
+  private readonly connectionMidpoint = new THREE.Vector3();
+  private readonly connectionParentPoint = new THREE.Vector3();
+  private readonly connectionChildPoint = new THREE.Vector3();
+  private readonly connectionMatrix = new THREE.Matrix4();
+  private readonly connectionScale = new THREE.Vector3();
+  private readonly connectionRotation = new THREE.Quaternion();
   private readonly visuals = new Map<string, CubeVisual>();
   private readonly pickables: THREE.Object3D[] = [];
   private readonly callbacks: SceneCallbacks;
@@ -71,8 +116,14 @@ export class PunkCubesScene {
   private selectedId: string | null = null;
   private cameraTween: CameraTween | null = null;
   private particles: THREE.Points | null = null;
-  private reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  private pointerDown = { x: 0, y: 0 };
+  private connections: THREE.InstancedMesh<THREE.CylinderGeometry, THREE.MeshBasicMaterial> | null = null;
+  private connectionData: DockConnection[] = [];
+  private connectionsVisible = false;
+  private drag: DragState | null = null;
+  private settle: SettleState | null = null;
+  private lastFrameAt = performance.now();
+  private readonly motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+  private reducedMotion = this.motionQuery.matches;
 
   constructor(canvas: HTMLCanvasElement, callbacks: SceneCallbacks) {
     this.callbacks = callbacks;
@@ -100,6 +151,8 @@ export class PunkCubesScene {
     this.controls.maxDistance = 240;
     this.controls.maxPolarAngle = Math.PI * 0.49;
     this.controls.target.set(0, 1.5, 0);
+    this.controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
+    this.controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
 
     this.composer = new EffectComposer(this.renderer);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
@@ -109,13 +162,15 @@ export class PunkCubesScene {
     this.addLights();
     this.addGround();
 
-    canvas.addEventListener('pointermove', this.onPointerMove);
-    canvas.addEventListener('pointerleave', this.onPointerLeave);
-    canvas.addEventListener('pointerdown', this.onPointerDown);
-    canvas.addEventListener('pointerup', this.onPointerUp);
-
-    const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
-    motionQuery.addEventListener('change', this.onMotionPreference);
+    // Capture before OrbitControls' bubble listeners: a primary pointer has
+    // exactly one owner (cube or camera), never an accidental hybrid.
+    canvas.addEventListener('pointermove', this.onPointerMove, true);
+    canvas.addEventListener('pointerleave', this.onPointerLeave, true);
+    canvas.addEventListener('pointerdown', this.onPointerDown, true);
+    canvas.addEventListener('pointerup', this.onPointerUp, true);
+    canvas.addEventListener('pointercancel', this.onPointerCancel, true);
+    canvas.addEventListener('lostpointercapture', this.onLostPointerCapture, true);
+    this.motionQuery.addEventListener('change', this.onMotionPreference);
 
     this.resizeObserver = new ResizeObserver(this.resize);
     this.resizeObserver.observe(canvas.parentElement ?? canvas);
@@ -139,6 +194,7 @@ export class PunkCubesScene {
       const plot = new THREE.Mesh(geometry, material);
       plot.position.set(district.center.x, -0.09, district.center.z);
       plot.userData.decorative = true;
+      plot.userData.districtFloor = true;
       this.world.add(plot);
 
       const border = new THREE.LineSegments(
@@ -147,6 +203,7 @@ export class PunkCubesScene {
       );
       border.position.copy(plot.position);
       border.userData.decorative = true;
+      border.userData.districtBorder = true;
       this.world.add(border);
 
       const label = this.makeDistrictLabel(district.name, color);
@@ -160,6 +217,7 @@ export class PunkCubesScene {
 
     const orderedCubes = [...layout.cubes].sort((a, b) => a.depth - b.depth);
     for (const cube of orderedCubes) this.addCube(cube);
+    this.createConnections();
     this.addParticles(layout.radius);
     this.applyBeauty();
     this.focusHome(false);
@@ -168,6 +226,11 @@ export class PunkCubesScene {
   setBeauty(value: number): void {
     this.beauty = THREE.MathUtils.clamp(value, 0, 1);
     this.applyBeauty();
+  }
+
+  setConnectionsVisible(visible: boolean): void {
+    this.connectionsVisible = visible;
+    if (this.connections) this.connections.visible = visible;
   }
 
   focusHome(animated = true): void {
@@ -209,11 +272,13 @@ export class PunkCubesScene {
     cancelAnimationFrame(this.frame);
     this.resizeObserver.disconnect();
     const canvas = this.renderer.domElement;
-    canvas.removeEventListener('pointermove', this.onPointerMove);
-    canvas.removeEventListener('pointerleave', this.onPointerLeave);
-    canvas.removeEventListener('pointerdown', this.onPointerDown);
-    canvas.removeEventListener('pointerup', this.onPointerUp);
-    window.matchMedia('(prefers-reduced-motion: reduce)').removeEventListener('change', this.onMotionPreference);
+    canvas.removeEventListener('pointermove', this.onPointerMove, true);
+    canvas.removeEventListener('pointerleave', this.onPointerLeave, true);
+    canvas.removeEventListener('pointerdown', this.onPointerDown, true);
+    canvas.removeEventListener('pointerup', this.onPointerUp, true);
+    canvas.removeEventListener('pointercancel', this.onPointerCancel, true);
+    canvas.removeEventListener('lostpointercapture', this.onLostPointerCapture, true);
+    this.motionQuery.removeEventListener('change', this.onMotionPreference);
     this.clearLayout();
     this.controls.dispose();
     this.composer.dispose();
@@ -364,23 +429,101 @@ export class PunkCubesScene {
     this.world.add(this.particles);
   }
 
+  private createConnections(): void {
+    const children = [...this.visuals.values()].filter((visual) => visual.cube.parentId);
+    if (children.length === 0) return;
+    const maximumLines = Math.max(1, ...children.map((visual) => visual.cube.node.lines));
+    this.connectionData = children.map((child) => {
+      const parent = this.visuals.get(child.cube.parentId!);
+      return {
+        parentId: child.cube.parentId!,
+        childId: child.cube.node.id,
+        radius: connectionRadius(child.cube.node.lines, maximumLines),
+        color: parent?.palette.clone().lerp(child.palette, 0.58) ?? child.palette.clone(),
+      };
+    });
+    const geometry = new THREE.CylinderGeometry(1, 1, 1, 6, 1, true);
+    const material = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.28,
+      depthWrite: false,
+      depthTest: true,
+      vertexColors: true,
+      blending: THREE.NormalBlending,
+    });
+    this.connections = new THREE.InstancedMesh(geometry, material, this.connectionData.length);
+    this.connections.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.connections.frustumCulled = false;
+    this.connections.visible = this.connectionsVisible;
+    this.connections.renderOrder = 3;
+    this.connections.userData.decorative = true;
+    this.connectionData.forEach((connection, index) => this.connections!.setColorAt(index, connection.color));
+    if (this.connections.instanceColor) this.connections.instanceColor.needsUpdate = true;
+    this.world.add(this.connections);
+    this.updateConnections();
+  }
+
+  private updateConnections(): void {
+    if (!this.connections) return;
+    this.connectionData.forEach((connection, index) => {
+      const parent = this.visuals.get(connection.parentId);
+      const child = this.visuals.get(connection.childId);
+      if (!parent || !child) return;
+      this.connectionDirection.subVectors(child.mesh.position, parent.mesh.position);
+      const length = Math.max(this.connectionDirection.length(), 0.001);
+      this.connectionDirection.multiplyScalar(1 / length);
+      this.connectionParentPoint.copy(parent.mesh.position).addScaledVector(this.connectionDirection, parent.cube.size * 0.18);
+      this.connectionChildPoint.copy(child.mesh.position).addScaledVector(this.connectionDirection, -child.cube.size * 0.2);
+      this.connectionMidpoint.addVectors(this.connectionParentPoint, this.connectionChildPoint).multiplyScalar(0.5);
+      const visibleLength = Math.max(this.connectionParentPoint.distanceTo(this.connectionChildPoint), 0.012);
+      this.connectionRotation.setFromUnitVectors(this.connectionUp, this.connectionDirection);
+      this.connectionScale.set(connection.radius, visibleLength, connection.radius);
+      this.connectionMatrix.compose(this.connectionMidpoint, this.connectionRotation, this.connectionScale);
+      this.connections!.setMatrixAt(index, this.connectionMatrix);
+    });
+    this.connections.instanceMatrix.needsUpdate = true;
+  }
+
   private applyBeauty(): void {
-    this.bloom.strength = 0.04 + this.beauty * 0.56;
-    this.bloom.radius = 0.2 + this.beauty * 0.42;
+    this.bloom.strength = 0.03 + this.beauty * 0.72;
+    this.bloom.radius = 0.18 + this.beauty * 0.5;
     this.bloom.threshold = 0.96 - this.beauty * 0.16;
-    this.renderer.toneMappingExposure = 1.02 + this.beauty * 0.3;
+    this.renderer.toneMappingExposure = 0.98 + this.beauty * 0.58;
 
     const fog = this.scene.fog;
-    if (fog instanceof THREE.FogExp2) fog.density = 0.004 + this.beauty * 0.005;
+    const background = new THREE.Color(0x08090b).lerp(new THREE.Color(0x100817), this.beauty);
+    if (this.scene.background instanceof THREE.Color) this.scene.background.copy(background);
+    if (fog instanceof THREE.FogExp2) {
+      fog.color.copy(background);
+      fog.density = 0.007 - this.beauty * 0.0035;
+    }
     this.scene.traverse((object) => {
       if (object instanceof THREE.PointLight && object.userData.beautyLight === true) {
-        object.intensity = (object.color.getHex() === PALETTE[0] ? 32 : 26) * (0.18 + this.beauty * 0.82);
+        object.intensity = (object.color.getHex() === PALETTE[0] ? 36 : 30) * (0.12 + this.beauty * 1.08);
+      }
+      if (object instanceof THREE.Mesh && object.userData.districtFloor === true) {
+        (object.material as THREE.MeshBasicMaterial).opacity = 0.025 + this.beauty * 0.13;
+      }
+      if (object instanceof THREE.LineSegments && object.userData.districtBorder === true) {
+        (object.material as THREE.LineBasicMaterial).opacity = 0.08 + this.beauty * 0.28;
       }
     });
     if (this.particles) {
       const material = this.particles.material as THREE.PointsMaterial;
       material.opacity = this.beauty * 0.42;
       material.size = 0.025 + this.beauty * 0.05;
+    }
+    if (this.connections) this.connections.material.opacity = 0.12 + this.beauty * 0.48;
+    for (const visual of this.visuals.values()) {
+      const material = visual.mesh.material;
+      const isVariable = visual.cube.node.kind === 'variable';
+      const chroma = isVariable ? 0.28 + this.beauty * 0.34 : 0.025 + this.beauty * 0.2;
+      material.color.copy(new THREE.Color(BASE_COLORS[visual.cube.node.kind]).lerp(visual.palette, chroma));
+      material.roughness = THREE.MathUtils.lerp(isVariable ? 0.48 : 0.78, isVariable ? 0.18 : 0.34, this.beauty);
+      material.metalness = THREE.MathUtils.lerp(isVariable ? 0.08 : 0.02, isVariable ? 0.46 : 0.28, this.beauty);
+      material.clearcoat = THREE.MathUtils.lerp(0.05, isVariable ? 0.92 : 0.58, this.beauty);
+      if (visual.edges) visual.edges.material.color.copy(new THREE.Color(0x7d858d).lerp(visual.palette, this.beauty * 0.7));
     }
     this.updateActiveBranch();
   }
@@ -410,7 +553,10 @@ export class PunkCubesScene {
       const isActive = activeIds.has(visual.cube.node.id);
       const isDirect = visual.cube.node.id === activeId;
       const kind = visual.cube.node.kind;
-      const base = new THREE.Color(BASE_COLORS[kind]).lerp(visual.palette, kind === 'variable' ? 0.46 : 0.1);
+      const base = new THREE.Color(BASE_COLORS[kind]).lerp(
+        visual.palette,
+        kind === 'variable' ? 0.28 + this.beauty * 0.34 : 0.025 + this.beauty * 0.2,
+      );
       visual.mesh.material.color.copy(isActive ? base.clone().lerp(visual.palette, 0.5 + this.beauty * 0.35) : base);
       visual.mesh.material.emissiveIntensity = isDirect
         ? 0.25 + this.beauty * 1.35
@@ -422,14 +568,15 @@ export class PunkCubesScene {
               ? 0.045
               : 0.022;
       const isAncestor = isActive && !isDirect && this.isAncestorOf(visual.cube.node.id, activeId);
-      if (kind === 'file') visual.mesh.material.opacity = isAncestor ? 0.045 : 0.14 + this.beauty * 0.07;
-      if (kind === 'function') visual.mesh.material.opacity = isAncestor ? 0.11 : 0.3 + this.beauty * 0.11;
-      if (visual.edges) visual.edges.material.opacity = isDirect ? 0.95 : kind === 'file' ? 0.58 + this.beauty * 0.1 : 0.44 + this.beauty * 0.08;
+      if (kind === 'file') visual.mesh.material.opacity = isAncestor ? 0.045 : 0.1 + this.beauty * 0.24;
+      if (kind === 'function') visual.mesh.material.opacity = isAncestor ? 0.11 : 0.24 + this.beauty * 0.28;
+      if (visual.edges) visual.edges.material.opacity = isDirect ? 0.98 : kind === 'file' ? 0.5 + this.beauty * 0.36 : 0.38 + this.beauty * 0.36;
       if (visual.aura) visual.aura.material.opacity = isDirect ? 0.015 + this.beauty * 0.1 : 0;
     }
   }
 
   private clearLayout(): void {
+    this.releaseCubeGesture();
     for (const object of [...this.world.children]) {
       this.world.remove(object);
       if (object instanceof THREE.Sprite) {
@@ -444,6 +591,9 @@ export class PunkCubesScene {
     this.visuals.clear();
     this.pickables.length = 0;
     this.particles = null;
+    this.connections = null;
+    this.connectionData = [];
+    this.settle = null;
     this.hoveredId = null;
     this.selectedId = null;
   }
@@ -468,7 +618,7 @@ export class PunkCubesScene {
       context.letterSpacing = '4px';
       context.fillStyle = `#${color.getHexString()}`;
       context.globalAlpha = 0.88;
-      context.fillText(name.toUpperCase(), 16, 58);
+      context.fillText(name.toLowerCase(), 16, 58);
       context.fillStyle = 'rgba(255,255,255,0.3)';
       context.fillRect(16, 74, 122, 2);
     }
@@ -499,13 +649,17 @@ export class PunkCubesScene {
     };
   }
 
-  private readonly onPointerMove = (event: PointerEvent): void => {
+  private updatePointer(event: PointerEvent): void {
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, this.camera);
-    // Transparent parent shells are hit before the symbols they contain. Pick
-    // the deepest intersected cube so the hierarchy remains directly usable.
+  }
+
+  private pickCube(event: PointerEvent): { visual: CubeVisual; point: THREE.Vector3 } | null {
+    this.updatePointer(event);
+    // Transparent parent shells are hit first. The deepest intersected cube is
+    // the usable target, matching the visual semantic containment.
     const hit = this.raycaster
       .intersectObjects(this.pickables, false)
       .sort((left, right) => {
@@ -514,35 +668,225 @@ export class PunkCubesScene {
         return rightDepth - leftDepth || left.distance - right.distance;
       })[0];
     const cubeId = typeof hit?.object.userData.cubeId === 'string' ? hit.object.userData.cubeId : null;
+    const visual = cubeId ? this.visuals.get(cubeId) ?? null : null;
+    return visual && hit ? { visual, point: hit.point.clone() } : null;
+  }
+
+  private subtreeIds(rootId: string): string[] {
+    return [...this.visuals.values()]
+      .filter((visual) => visual.cube.node.id === rootId || this.isAncestorOf(rootId, visual.cube.node.id))
+      .map((visual) => visual.cube.node.id);
+  }
+
+  private syncAttachments(visual: CubeVisual): void {
+    if (visual.edges) {
+      visual.edges.position.copy(visual.mesh.position);
+      visual.edges.quaternion.copy(visual.mesh.quaternion);
+    }
+    if (visual.aura) {
+      visual.aura.position.copy(visual.mesh.position);
+      visual.aura.quaternion.copy(visual.mesh.quaternion);
+    }
+  }
+
+  private applySubtreeOffset(ids: readonly string[], rootHome: THREE.Vector3, rootPosition: THREE.Vector3): void {
+    const offset = rootPosition.clone().sub(rootHome);
+    for (const id of ids) {
+      const visual = this.visuals.get(id);
+      if (!visual) continue;
+      visual.mesh.position.set(visual.cube.center.x + offset.x, visual.cube.center.y + offset.y, visual.cube.center.z + offset.z);
+      this.syncAttachments(visual);
+    }
+    this.updateConnections();
+  }
+
+  private setRootTilt(rootId: string, tilt: THREE.Vector2): void {
+    const visual = this.visuals.get(rootId);
+    if (!visual) return;
+    visual.mesh.rotation.set(tilt.x, 0, tilt.y);
+    this.syncAttachments(visual);
+  }
+
+  private cancelSettle(nextRootId: string): void {
+    const settle = this.settle;
+    if (!settle) return;
+    const visual = this.visuals.get(settle.rootId);
+    // Regrabbing the same root preserves its in-flight position and tilt; it
+    // feels interruptible rather than teleporting through the hand. A new
+    // root, however, must first return the older subtree exactly home.
+    if (settle.rootId !== nextRootId) {
+      this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome);
+      if (visual) {
+        visual.mesh.quaternion.copy(this.identityQuaternion);
+        this.syncAttachments(visual);
+        if (visual.aura) visual.aura.material.opacity = 0;
+      }
+      this.updateConnections();
+    }
+    this.settle = null;
+  }
+
+  private releaseCubeGesture(): void {
+    const drag = this.drag;
+    this.drag = null;
+    if (drag && this.renderer.domElement.hasPointerCapture(drag.pointerId)) {
+      this.renderer.domElement.releasePointerCapture(drag.pointerId);
+    }
+    this.controls.enabled = true;
+    this.renderer.domElement.style.cursor = 'grab';
+  }
+
+  private beginDrag(event: PointerEvent, picked: { visual: CubeVisual; point: THREE.Vector3 }): void {
+    this.cancelSettle(picked.visual.cube.node.id);
+    this.cameraTween = null;
+    const root = picked.visual;
+    this.camera.getWorldDirection(this.cameraDirection);
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(this.cameraDirection, picked.point);
+    const rootHome = new THREE.Vector3(root.cube.center.x, root.cube.center.y, root.cube.center.z);
+    const rootStart = root.mesh.position.clone();
+    this.drag = {
+      pointerId: event.pointerId,
+      rootId: root.cube.node.id,
+      subtreeIds: this.subtreeIds(root.cube.node.id),
+      plane,
+      grabOffset: rootStart.clone().sub(picked.point),
+      rootHome,
+      startClient: { x: event.clientX, y: event.clientY },
+      lastPoint: picked.point.clone(),
+      lastTime: performance.now(),
+      velocity: new THREE.Vector3(),
+      moved: false,
+    };
+    this.controls.enabled = false;
+    this.renderer.domElement.setPointerCapture(event.pointerId);
+    this.renderer.domElement.style.cursor = 'grabbing';
+  }
+
+  private dragTo(event: PointerEvent): void {
+    const drag = this.drag;
+    if (!drag) return;
+    this.updatePointer(event);
+    if (!this.raycaster.ray.intersectPlane(drag.plane, this.dragPoint)) return;
+    const now = performance.now();
+    const nextRoot = this.dragPoint.clone().add(drag.grabOffset);
+    const dt = Math.min(Math.max((now - drag.lastTime) / 1000, 1 / 240), 1 / 20);
+    drag.velocity.copy(this.dragPoint).sub(drag.lastPoint).multiplyScalar(1 / dt).clampLength(0, 34);
+    drag.lastPoint.copy(this.dragPoint);
+    drag.lastTime = now;
+    drag.moved ||= Math.hypot(event.clientX - drag.startClient.x, event.clientY - drag.startClient.y) > (event.pointerType === 'touch' ? 9 : 5);
+    this.applySubtreeOffset(drag.subtreeIds, drag.rootHome, nextRoot);
+    // Velocity tilts only the grabbed shell, bounded below six degrees.
+    this.setRootTilt(
+      drag.rootId,
+      new THREE.Vector2(
+        THREE.MathUtils.clamp(-drag.velocity.z * 0.012, -0.095, 0.095),
+        THREE.MathUtils.clamp(drag.velocity.x * 0.012, -0.095, 0.095),
+      ),
+    );
+  }
+
+  private endDrag(cancelled: boolean): void {
+    const drag = this.drag;
+    if (!drag) return;
+    this.releaseCubeGesture();
+    const visual = this.visuals.get(drag.rootId);
+    if (!visual) return;
+    if (!cancelled && !drag.moved) this.focusCube(visual.cube);
+    if (this.reducedMotion) {
+      this.applySubtreeOffset(drag.subtreeIds, drag.rootHome, drag.rootHome);
+      visual.mesh.quaternion.copy(this.identityQuaternion);
+      this.syncAttachments(visual);
+      this.updateConnections();
+      return;
+    }
+    this.settle = {
+      rootId: drag.rootId,
+      subtreeIds: drag.subtreeIds,
+      rootHome: drag.rootHome,
+      position: visual.mesh.position.clone(),
+      velocity: drag.velocity.clone().clampLength(0, 18),
+      tilt: new THREE.Vector2(visual.mesh.rotation.x, visual.mesh.rotation.z),
+      tiltVelocity: new THREE.Vector2(),
+      flash: 1,
+    };
+  }
+
+  private readonly onPointerMove = (event: PointerEvent): void => {
+    if (this.drag) {
+      if (event.pointerId !== this.drag.pointerId) {
+        if (event.pointerType === 'touch') event.stopImmediatePropagation();
+        return;
+      }
+      this.dragTo(event);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+    const picked = this.pickCube(event);
+    const cubeId = picked?.visual.cube.node.id ?? null;
     if (cubeId === this.hoveredId) {
-      if (cubeId) this.callbacks.onHover(this.visuals.get(cubeId)?.cube ?? null, { x: event.clientX, y: event.clientY });
+      if (picked) this.callbacks.onHover(picked.visual.cube, { x: event.clientX, y: event.clientY });
       return;
     }
     this.hoveredId = cubeId;
-    this.renderer.domElement.style.cursor = cubeId ? 'pointer' : 'grab';
-    this.callbacks.onHover(cubeId ? this.visuals.get(cubeId)?.cube ?? null : null, cubeId ? { x: event.clientX, y: event.clientY } : null);
+    this.renderer.domElement.style.cursor = 'grab';
+    this.callbacks.onHover(picked?.visual.cube ?? null, picked ? { x: event.clientX, y: event.clientY } : null);
     this.updateActiveBranch();
   };
 
   private readonly onPointerLeave = (): void => {
+    if (this.drag) return;
     this.hoveredId = null;
     this.callbacks.onHover(null, null);
     this.updateActiveBranch();
   };
 
   private readonly onPointerDown = (event: PointerEvent): void => {
-    this.pointerDown = { x: event.clientX, y: event.clientY };
+    // A second finger cannot enter OrbitControls while a cube owns gesture one.
+    if (this.drag) {
+      if (event.pointerType === 'touch') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      return;
+    }
+    if (!event.isPrimary || event.button !== 0) return;
+    const picked = this.pickCube(event);
+    if (!picked) return; // empty space remains OrbitControls territory
+    this.beginDrag(event, picked);
+    event.preventDefault();
+    event.stopImmediatePropagation();
   };
 
   private readonly onPointerUp = (event: PointerEvent): void => {
-    const moved = Math.hypot(event.clientX - this.pointerDown.x, event.clientY - this.pointerDown.y);
-    if (moved > 5) return;
-    const cube = this.hoveredId ? this.visuals.get(this.hoveredId)?.cube : null;
-    if (cube) this.focusCube(cube);
+    if (!this.drag) return;
+    if (event.pointerId !== this.drag.pointerId) {
+      if (event.pointerType === 'touch') event.stopImmediatePropagation();
+      return;
+    }
+    this.endDrag(false);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+
+  private readonly onPointerCancel = (event: PointerEvent): void => {
+    if (!this.drag || event.pointerId !== this.drag.pointerId) return;
+    this.endDrag(true);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+
+  private readonly onLostPointerCapture = (event: PointerEvent): void => {
+    if (!this.drag || event.pointerId !== this.drag.pointerId) return;
+    this.endDrag(true);
   };
 
   private readonly onMotionPreference = (event: MediaQueryListEvent): void => {
     this.reducedMotion = event.matches;
+    if (!event.matches) return;
+    this.cameraTween = null;
+    this.finishSettleImmediately();
+    for (const visual of this.visuals.values()) visual.aura?.scale.setScalar(1.035);
   };
 
   private readonly resize = (): void => {
@@ -560,7 +904,10 @@ export class PunkCubesScene {
 
   private readonly animate = (): void => {
     this.frame = requestAnimationFrame(this.animate);
-    const elapsed = performance.now() * 0.001;
+    const now = performance.now();
+    const elapsed = now * 0.001;
+    const dt = Math.min(Math.max((now - this.lastFrameAt) / 1000, 0), 1 / 20);
+    this.lastFrameAt = now;
 
     if (this.cameraTween) {
       const progress = THREE.MathUtils.clamp((performance.now() - this.cameraTween.startedAt) / this.cameraTween.duration, 0, 1);
@@ -581,7 +928,68 @@ export class PunkCubesScene {
       if (aura) aura.scale.setScalar(1.035 + Math.sin(elapsed * 2.1) * 0.008 * this.beauty);
     }
 
+    if (this.settle) this.advanceSettle(dt);
+
     this.controls.update();
     this.composer.render();
   };
+
+  private advanceSettle(dt: number): void {
+    const settle = this.settle;
+    if (!settle) return;
+    const root = this.visuals.get(settle.rootId);
+    if (!root) {
+      this.settle = null;
+      return;
+    }
+    // Fixed substeps make tab-resume and low-frame-rate interaction behave
+    // like the same 450 ms magnetic dock, rather than a different animation.
+    const steps = Math.max(1, Math.ceil(dt / (1 / 120)));
+    const stepDt = dt / steps;
+    for (let index = 0; index < steps; index += 1) {
+      const x = stepSpring({ value: settle.position.x, velocity: settle.velocity.x }, settle.rootHome.x, stepDt, DOCK_SPRING);
+      const y = stepSpring({ value: settle.position.y, velocity: settle.velocity.y }, settle.rootHome.y, stepDt, DOCK_SPRING);
+      const z = stepSpring({ value: settle.position.z, velocity: settle.velocity.z }, settle.rootHome.z, stepDt, DOCK_SPRING);
+      settle.position.set(x.value, y.value, z.value);
+      settle.velocity.set(x.velocity, y.velocity, z.velocity);
+      const rotationConfig = { omega: 13, zeta: 0.72 };
+      const tiltX = stepSpring({ value: settle.tilt.x, velocity: settle.tiltVelocity.x }, 0, stepDt, rotationConfig);
+      const tiltZ = stepSpring({ value: settle.tilt.y, velocity: settle.tiltVelocity.y }, 0, stepDt, rotationConfig);
+      settle.tilt.set(tiltX.value, tiltZ.value);
+      settle.tiltVelocity.set(tiltX.velocity, tiltZ.velocity);
+    }
+    this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.position);
+    this.setRootTilt(settle.rootId, settle.tilt);
+    settle.flash = Math.max(0, settle.flash - dt * 2.4);
+    if (root.aura) root.aura.material.opacity = (0.02 + settle.flash * 0.13) * this.beauty;
+    const xState: SpringScalar = { value: settle.position.x, velocity: settle.velocity.x };
+    const yState: SpringScalar = { value: settle.position.y, velocity: settle.velocity.y };
+    const zState: SpringScalar = { value: settle.position.z, velocity: settle.velocity.z };
+    if (
+      springSettled(xState, settle.rootHome.x) &&
+      springSettled(yState, settle.rootHome.y) &&
+      springSettled(zState, settle.rootHome.z) &&
+      settle.tilt.length() < 0.002 &&
+      settle.tiltVelocity.length() < 0.015
+    ) {
+      this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome);
+      root.mesh.quaternion.copy(this.identityQuaternion);
+      this.syncAttachments(root);
+      this.settle = null;
+    }
+  }
+
+  private finishSettleImmediately(): void {
+    const settle = this.settle;
+    if (!settle) return;
+    const root = this.visuals.get(settle.rootId);
+    this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome);
+    if (root) {
+      root.mesh.quaternion.copy(this.identityQuaternion);
+      this.syncAttachments(root);
+      if (root.aura) root.aura.material.opacity = 0;
+    }
+    this.updateConnections();
+    this.settle = null;
+  }
 }

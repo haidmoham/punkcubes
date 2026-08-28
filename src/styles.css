@@ -83,8 +83,9 @@ a:active {
   width: 100%;
   height: 100%;
   background:
-    radial-gradient(circle at 10% 10%, rgb(182 255 74 / calc(var(--beauty) * 0.035)), transparent 25%),
-    radial-gradient(circle at 88% 4%, rgb(104 223 255 / calc(var(--beauty) * 0.04)), transparent 22%),
+    radial-gradient(circle at 10% 10%, rgb(182 255 74 / calc(var(--beauty) * 0.14)), transparent 28%),
+    radial-gradient(circle at 88% 4%, rgb(104 223 255 / calc(var(--beauty) * 0.13)), transparent 26%),
+    radial-gradient(circle at 72% 86%, rgb(255 85 200 / calc(var(--beauty) * 0.08)), transparent 32%),
     #08090b;
 }
 
@@ -179,7 +180,6 @@ a:active {
   color: #7f858e;
   font: 500 9px/1 'DM Mono', monospace;
   letter-spacing: 0.14em;
-  text-transform: uppercase;
 }
 
 .repo-field {
@@ -572,7 +572,6 @@ a:active {
   color: var(--cyan);
   font: 500 8px/1 'DM Mono', monospace;
   letter-spacing: 0.12em;
-  text-transform: uppercase;
 }
 
 .kind-chip.function {
@@ -752,6 +751,14 @@ a:active {
   color: var(--acid);
 }
 
+.scene-tools #connections-button[aria-pressed='false'] {
+  color: #69717b;
+}
+
+.scene-tools #connections-button[aria-pressed='false']:hover {
+  color: var(--acid);
+}
+
 .legend {
   position: absolute;
   right: 22px;
@@ -928,6 +935,15 @@ a:active {
     right: 12px;
     bottom: 11px;
     justify-content: space-between;
+    gap: 5px;
+  }
+
+  .scene-tools button,
+  .scene-tools a {
+    min-width: 0;
+    padding-right: 8px;
+    padding-left: 8px;
+    white-space: nowrap;
   }
 
   .legend {

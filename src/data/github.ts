@@ -34,10 +34,10 @@ function apiError(response: Response, body: unknown): Error {
   if (response.status === 403 && /rate limit/i.test(message)) {
     const reset = response.headers.get('x-ratelimit-reset');
     const retryAt = reset ? new Date(Number(reset) * 1000).toLocaleTimeString() : 'later';
-    return new Error(`GitHub API rate limit reached. Try again after ${retryAt}, or load a smaller public repository.`);
+    return new Error(`github api rate limit reached. try again after ${retryAt.toLowerCase()}, or load a smaller public repository.`);
   }
-  if (response.status === 404) return new Error('Repository not found. Check that it is public and that the owner/repository name is correct.');
-  return new Error(`GitHub request failed (${response.status}): ${message}`);
+  if (response.status === 404) return new Error('repository not found. check that it is public and that the owner/repository name is correct.');
+  return new Error(`github request failed (${response.status}): ${message}`.toLowerCase());
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -66,7 +66,7 @@ export function parseRepositoryRef(input: string): RepositoryRef {
       : value.split('/').filter(Boolean);
   const [owner, repo] = parts;
   if (!owner || !repo || parts.length !== 2 || !/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo)) {
-    throw new Error('Enter a public GitHub repository as “owner/repo” (for example, “haidmoham/fourier-drawing”).');
+    throw new Error('enter a public github repository as “owner/repo” (for example, “haidmoham/fourier-drawing”).');
   }
   return { owner, repo };
 }
@@ -112,23 +112,23 @@ async function mapConcurrent<T, R>(items: T[], concurrency: number, worker: (ite
 /** Load enough source to give the city useful structure while guarding the browser from giant repos. */
 export async function loadRepository(input: RepositoryRef, onProgress?: ProgressReporter): Promise<RepositorySnapshot> {
   const { owner, repo } = input;
-  report(onProgress, { phase: 'repo', completed: 0, total: 1, detail: `Reading ${owner}/${repo}` });
+  report(onProgress, { phase: 'repo', completed: 0, total: 1, detail: `reading ${owner}/${repo}` });
   const repository = await getJson<GitHubRepository>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
-  report(onProgress, { phase: 'repo', completed: 1, total: 1, detail: `Found ${owner}/${repo}` });
+  report(onProgress, { phase: 'repo', completed: 1, total: 1, detail: `found ${owner}/${repo}` });
 
-  report(onProgress, { phase: 'tree', completed: 0, total: 1, detail: `Mapping ${repository.default_branch}` });
+  report(onProgress, { phase: 'tree', completed: 0, total: 1, detail: `mapping ${repository.default_branch}` });
   const ref = await getJson<GitRefResponse>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${encodeURIComponent(repository.default_branch)}`);
   const commitSha = ref.object.sha;
   const tree = await getJson<GitTreeResponse>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${commitSha}?recursive=1`);
   const candidates = sourceCandidates(tree.tree);
-  if (candidates.length === 0) throw new Error('This repository has no loadable source files within the visualization limits.');
-  report(onProgress, { phase: 'tree', completed: 1, total: 1, detail: `${candidates.length} files selected${tree.truncated ? ' (tree truncated by GitHub)' : ''}` });
+  if (candidates.length === 0) throw new Error('this repository has no loadable source files within the visualization limits.');
+  report(onProgress, { phase: 'tree', completed: 1, total: 1, detail: `${candidates.length} files selected${tree.truncated ? ' (tree truncated by github)' : ''}` });
 
   let completed = 0;
   // Keeping this dynamic makes the TypeScript compiler a lazy Vite chunk; the landing
   // experience has no need to download it until a repository is actually requested.
   const { assembleDirectoryTree, makeFileNode, summarizeTree } = await import('./parser');
-  report(onProgress, { phase: 'source', completed, total: candidates.length, detail: 'Fetching source files' });
+  report(onProgress, { phase: 'source', completed, total: candidates.length, detail: 'fetching source files' });
   const files = await mapConcurrent(candidates, CONCURRENCY, async (item) => {
     try {
       const content = await fetchRaw(owner, repo, commitSha, item.path);
@@ -139,17 +139,17 @@ export async function loadRepository(input: RepositoryRef, onProgress?: Progress
     } catch (error) {
       // A single unreadable blob should not blank an otherwise usable public repository.
       completed += 1;
-      report(onProgress, { phase: 'source', completed, total: candidates.length, detail: `Skipped ${item.path}` });
+      report(onProgress, { phase: 'source', completed, total: candidates.length, detail: `skipped ${item.path}` });
       return null;
     }
   });
   const loaded = files.filter((file): file is NonNullable<typeof file> => file !== null);
-  if (loaded.length === 0) throw new Error('GitHub returned no readable source files for this repository.');
+  if (loaded.length === 0) throw new Error('github returned no readable source files for this repository.');
 
-  report(onProgress, { phase: 'parse', completed: loaded.length, total: loaded.length, detail: 'Building code hierarchy' });
+  report(onProgress, { phase: 'parse', completed: loaded.length, total: loaded.length, detail: 'building code hierarchy' });
   const root = assembleDirectoryTree(loaded, repo);
   const stats = summarizeTree(root);
-  report(onProgress, { phase: 'layout', completed: 1, total: 1, detail: 'Ready to lay out cubes' });
+  report(onProgress, { phase: 'layout', completed: 1, total: 1, detail: 'ready to lay out cubes' });
   return {
     owner, repo, defaultBranch: repository.default_branch, commitSha,
     description: repository.description, stars: repository.stargazers_count,

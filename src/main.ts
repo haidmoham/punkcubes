@@ -9,15 +9,15 @@ const DEFAULT_REPO = 'haidmoham/fourier-drawing';
 const DEFAULT_BEAUTY = 72;
 
 const app = document.querySelector<HTMLDivElement>('#app');
-if (!app) throw new Error('Missing #app mount point.');
+if (!app) throw new Error('missing #app mount point.');
 
 app.innerHTML = `
   <main class="app-shell">
     <header class="topbar">
-      <a class="brand" href="/" aria-label="Punkcubes home">
+      <a class="brand" href="/" aria-label="punkcubes home">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
         <span>
-          <strong>PUNKCUBES</strong>
+          <strong>punkcubes</strong>
           <small>code, stacked properly</small>
         </span>
       </a>
@@ -29,7 +29,7 @@ app.innerHTML = `
           <input id="repo-input" name="repo" value="${DEFAULT_REPO}" autocomplete="off" spellcheck="false" aria-describedby="repo-hint" />
           <button type="submit">pack it <span aria-hidden="true">→</span></button>
         </div>
-        <span id="repo-hint" class="sr-only">Enter an owner and repository, or a GitHub repository URL.</span>
+        <span id="repo-hint" class="sr-only">enter an owner and repository, or a github repository url.</span>
       </form>
 
       <div class="beauty-control">
@@ -42,12 +42,12 @@ app.innerHTML = `
       </div>
     </header>
 
-    <section class="viewport" aria-label="Interactive codebase visualization">
-      <canvas id="scene" tabindex="0" aria-label="3D repository hierarchy. Drag to orbit, scroll to zoom, and select cubes to inspect them."></canvas>
+    <section class="viewport" aria-label="interactive codebase visualization">
+      <canvas id="scene" tabindex="0" aria-label="3d repository hierarchy. primary drag on a cube moves it; drag empty space or right-drag anywhere orbits the camera; middle/wheel zooms; click inspects."></canvas>
 
       <div class="scene-meta" aria-live="polite">
         <span class="live-dot"></span>
-        <span id="scene-status">warming the lights</span>
+        <span id="scene-status">loading scene</span>
       </div>
 
       <div class="repo-summary" id="repo-summary" hidden>
@@ -60,17 +60,17 @@ app.innerHTML = `
 
       <div class="loading-card" id="loading-card">
         <div class="loading-cube" aria-hidden="true"><i></i><i></i><i></i></div>
-        <p class="eyebrow">NOW PACKING</p>
+        <p class="eyebrow">now packing</p>
         <h1 id="loading-title">fourier-drawing</h1>
-        <p id="loading-detail">asking GitHub what lives where</p>
+        <p id="loading-detail">asking github where things live</p>
         <div class="progress-track"><i id="progress-bar"></i></div>
         <small id="progress-count">0 / 0</small>
       </div>
 
       <div class="error-card" id="error-card" hidden>
         <span class="error-glyph" aria-hidden="true">!</span>
-        <p class="eyebrow">THE CUBES OBJECT</p>
-        <h2 id="error-title">Could not pack that repo.</h2>
+        <p class="eyebrow">packing failed</p>
+        <h2 id="error-title">could not pack that repo.</h2>
         <p id="error-detail"></p>
         <button id="retry-button" type="button">try again</button>
       </div>
@@ -86,15 +86,18 @@ app.innerHTML = `
       <div class="hover-label" id="hover-label" hidden></div>
 
       <div class="scene-tools">
-        <button type="button" id="home-button" title="Reset camera (H)">
+        <button type="button" id="home-button" title="reset camera (h)">
           <span aria-hidden="true">⌂</span><span>whole repo</span>
         </button>
+        <button type="button" id="connections-button" aria-pressed="true" aria-label="hide parent-child weighted connections" title="toggle parent-child weighted connections">
+          <span aria-hidden="true">⌁</span><span id="connections-label">connections: on</span>
+        </button>
         <a id="github-link" href="https://github.com/${DEFAULT_REPO}" target="_blank" rel="noreferrer">
-          <span>open source</span><span aria-hidden="true">↗</span>
+          <span>view on github</span><span aria-hidden="true">↗</span>
         </a>
       </div>
 
-      <div class="legend" aria-label="Cube hierarchy legend">
+      <div class="legend" aria-label="cube hierarchy legend">
         <span><i class="legend-cube file"></i> file</span>
         <span><i class="legend-cube method"></i> method</span>
         <span><i class="legend-cube variable"></i> variable</span>
@@ -102,8 +105,8 @@ app.innerHTML = `
     </section>
 
     <footer class="footer-note">
-      <span>drag to orbit · scroll to zoom · click to inspect</span>
-      <span>non-overlap is not negotiable</span>
+      <span>primary drag on cube: move it · empty space or right-drag anywhere: orbit camera · middle/wheel: zoom · click: inspect</span>
+      <span>no overlaps</span>
     </footer>
   </main>
 `;
@@ -131,11 +134,14 @@ const elements = {
   inspector: required<HTMLElement>('#inspector'),
   hover: required<HTMLElement>('#hover-label'),
   home: required<HTMLButtonElement>('#home-button'),
+  connections: required<HTMLButtonElement>('#connections-button'),
+  connectionsLabel: required<HTMLElement>('#connections-label'),
   github: required<HTMLAnchorElement>('#github-link'),
 };
 
 let currentSnapshot: RepositorySnapshot | null = null;
 let loadingRequest = 0;
+let connectionsVisible = true;
 
 const scene = new PunkCubesScene(elements.canvas, {
   onHover: renderHover,
@@ -156,11 +162,12 @@ elements.beauty.addEventListener('input', () => {
 });
 
 elements.home.addEventListener('click', () => scene.focusHome());
+elements.connections.addEventListener('click', () => setConnectionsVisible(!connectionsVisible));
 elements.retry.addEventListener('click', () => void visualize(elements.input.value));
 
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' || (event.key.toLowerCase() === 'h' && document.activeElement?.tagName !== 'INPUT')) {
-    scene.focusHome();
+    scene.focusHome(false);
   }
   if (event.key === '/' && document.activeElement !== elements.input) {
     event.preventDefault();
@@ -172,11 +179,13 @@ window.addEventListener('keydown', (event) => {
 const url = new URL(window.location.href);
 const initialRepo = url.searchParams.get('repo') ?? DEFAULT_REPO;
 const initialBeauty = clampNumber(Number(url.searchParams.get('beauty') ?? DEFAULT_BEAUTY), 0, 100);
+const initialConnectionsVisible = url.searchParams.get('connections') !== '0';
 elements.input.value = initialRepo;
 elements.beauty.value = String(initialBeauty);
 elements.beautyValue.value = String(initialBeauty);
 scene.setBeauty(initialBeauty / 100);
 document.documentElement.style.setProperty('--beauty', String(initialBeauty / 100));
+setConnectionsVisible(initialConnectionsVisible);
 void visualize(initialRepo);
 
 async function visualize(input: string): Promise<void> {
@@ -185,7 +194,7 @@ async function visualize(input: string): Promise<void> {
   try {
     repoRef = parseRepositoryRef(input);
   } catch (error) {
-    showError('That does not look like a repository.', getErrorMessage(error));
+    showError('that does not look like a repository.', getErrorMessage(error));
     return;
   }
 
@@ -193,10 +202,10 @@ async function visualize(input: string): Promise<void> {
   elements.loading.hidden = false;
   elements.error.hidden = true;
   elements.loadingTitle.textContent = repoRef.repo;
-  elements.loadingDetail.textContent = 'asking GitHub what lives where';
+  elements.loadingDetail.textContent = 'asking github where things live';
   elements.progressBar.style.width = '4%';
-  elements.progressCount.textContent = 'finding the front door';
-  elements.status.textContent = 'repo incoming';
+  elements.progressCount.textContent = 'finding files';
+  elements.status.textContent = 'loading repository';
   elements.canvas.setAttribute('aria-busy', 'true');
 
   try {
@@ -211,7 +220,7 @@ async function visualize(input: string): Promise<void> {
     });
     if (request !== loadingRequest) return;
 
-    elements.loadingDetail.textContent = 'giving every symbol some personal space';
+    elements.loadingDetail.textContent = 'spacing each symbol';
     elements.progressBar.style.width = '96%';
     await nextPaint();
     const layout = buildRepositoryLayout(snapshot.root);
@@ -220,7 +229,7 @@ async function visualize(input: string): Promise<void> {
     renderSummary(snapshot);
     renderInspector(null);
     elements.github.href = `https://github.com/${snapshot.owner}/${snapshot.repo}`;
-    elements.status.textContent = snapshot.truncated ? 'packed · source limit reached' : 'packed · zero overlaps';
+    elements.status.textContent = snapshot.truncated ? 'packed · source limit reached' : 'packed · no overlaps';
     elements.progressBar.style.width = '100%';
     elements.canvas.removeAttribute('aria-busy');
     updateUrl();
@@ -229,7 +238,7 @@ async function visualize(input: string): Promise<void> {
     }, window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 360);
   } catch (error) {
     if (request !== loadingRequest) return;
-    showError('Could not pack that repo.', getErrorMessage(error));
+    showError('could not pack that repo.', getErrorMessage(error));
   }
 }
 
@@ -282,7 +291,7 @@ function renderInspector(cube: LayoutCube | null): void {
   elements.inspector.innerHTML = `
     <div class="inspector-head">
       <span class="kind-chip ${node.kind}">${node.kind}</span>
-      <button type="button" class="close-inspector" aria-label="Close inspector">×</button>
+      <button type="button" class="close-inspector" aria-label="close inspector">×</button>
     </div>
     <p class="path-kicker">${escapeHtml(parentPath)}</p>
     <h2>${escapeHtml(node.name)}</h2>
@@ -315,12 +324,23 @@ function updateUrl(): void {
   const next = new URL(window.location.href);
   next.searchParams.set('repo', elements.input.value.trim() || DEFAULT_REPO);
   next.searchParams.set('beauty', elements.beauty.value);
+  if (connectionsVisible) next.searchParams.delete('connections');
+  else next.searchParams.set('connections', '0');
   window.history.replaceState(null, '', next);
+}
+
+function setConnectionsVisible(visible: boolean): void {
+  connectionsVisible = visible;
+  scene.setConnectionsVisible(visible);
+  elements.connections.setAttribute('aria-pressed', String(visible));
+  elements.connections.setAttribute('aria-label', `${visible ? 'hide' : 'show'} parent-child weighted connections`);
+  elements.connectionsLabel.textContent = `connections: ${visible ? 'on' : 'off'}`;
+  updateUrl();
 }
 
 function required<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
-  if (!element) throw new Error(`Missing required element: ${selector}`);
+  if (!element) throw new Error(`missing required element: ${selector}`);
   return element;
 }
 
@@ -338,9 +358,9 @@ function formatNumber(value: number): string {
 }
 
 function formatBytes(value: number): string {
-  if (value < 1000) return `${value} B`;
-  if (value < 1_000_000) return `${(value / 1000).toFixed(1)} KB`;
-  return `${(value / 1_000_000).toFixed(1)} MB`;
+  if (value < 1000) return `${value} b`;
+  if (value < 1_000_000) return `${(value / 1000).toFixed(1)} kb`;
+  return `${(value / 1_000_000).toFixed(1)} mb`;
 }
 
 function escapeHtml(value: string): string {
@@ -354,7 +374,9 @@ function escapeHtml(value: string): string {
 }
 
 function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'An unknown packing error occurred.';
+  if (!(error instanceof Error)) return 'an unknown packing error occurred.';
+  const message = error.message.trim();
+  return message ? `${message[0]!.toLowerCase()}${message.slice(1)}` : 'an unknown packing error occurred.';
 }
 
 function nextPaint(): Promise<void> {
