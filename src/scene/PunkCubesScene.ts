@@ -7,6 +7,7 @@ import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeom
 import type { CodeNodeKind } from '../data/types';
 import { connectionRadius } from './connections';
 import { DOCK_SPRING, springSettled, stepSpring, type SpringScalar } from './motion';
+import { areSwapCompatible, pickSwapSlot, type SwapSlot } from './swap';
 import type { LayoutCube, RepositoryLayout } from './types';
 
 const PALETTE = [0xb6ff4a, 0x68dfff, 0xff6b35, 0xff55c8, 0xffd166, 0x9f8cff];
@@ -20,6 +21,7 @@ const BASE_COLORS: Record<CodeNodeKind, number> = {
 interface SceneCallbacks {
   onHover: (cube: LayoutCube | null, point: { x: number; y: number } | null) => void;
   onSelect: (cube: LayoutCube | null) => void;
+  onSwapPreview: (source: LayoutCube | null, target: LayoutCube | null, state: 'idle' | 'seeking' | 'ready' | 'committed') => void;
 }
 
 interface CubeVisual {
@@ -50,6 +52,8 @@ interface DragState {
   pointerId: number;
   rootId: string;
   subtreeIds: string[];
+  compatibleSlots: SwapSlot[];
+  candidatePickables: THREE.Object3D[];
   plane: THREE.Plane;
   grabOffset: THREE.Vector3;
   rootHome: THREE.Vector3;
@@ -58,6 +62,7 @@ interface DragState {
   lastTime: number;
   velocity: THREE.Vector3;
   moved: boolean;
+  candidateId: string | null;
 }
 
 interface SettleState {
@@ -95,6 +100,8 @@ export class PunkCubesScene {
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2(20, 20);
   private readonly dragPoint = new THREE.Vector3();
+  private readonly dragRootPosition = new THREE.Vector3();
+  private readonly subtreeOffset = new THREE.Vector3();
   private readonly cameraDirection = new THREE.Vector3();
   private readonly identityQuaternion = new THREE.Quaternion();
   private readonly connectionUp = new THREE.Vector3(0, 1, 0);
@@ -106,6 +113,7 @@ export class PunkCubesScene {
   private readonly connectionScale = new THREE.Vector3();
   private readonly connectionRotation = new THREE.Quaternion();
   private readonly visuals = new Map<string, CubeVisual>();
+  private readonly visualHomes = new Map<string, THREE.Vector3>();
   private readonly pickables: THREE.Object3D[] = [];
   private readonly callbacks: SceneCallbacks;
   private readonly resizeObserver: ResizeObserver;
@@ -117,10 +125,14 @@ export class PunkCubesScene {
   private cameraTween: CameraTween | null = null;
   private particles: THREE.Points | null = null;
   private connections: THREE.InstancedMesh<THREE.CylinderGeometry, THREE.MeshBasicMaterial> | null = null;
+  private swapGuide: THREE.Line<THREE.BufferGeometry, THREE.LineBasicMaterial> | null = null;
   private connectionData: DockConnection[] = [];
   private connectionsVisible = false;
   private drag: DragState | null = null;
-  private settle: SettleState | null = null;
+  private readonly settles = new Map<string, SettleState>();
+  private swapSourceId: string | null = null;
+  private swapCandidateId: string | null = null;
+  private swapCueUntil = 0;
   private lastFrameAt = performance.now();
   private readonly motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
   private reducedMotion = this.motionQuery.matches;
@@ -195,6 +207,7 @@ export class PunkCubesScene {
       plot.position.set(district.center.x, -0.09, district.center.z);
       plot.userData.decorative = true;
       plot.userData.districtFloor = true;
+      plot.userData.palette = color.getHex();
       this.world.add(plot);
 
       const border = new THREE.LineSegments(
@@ -204,6 +217,7 @@ export class PunkCubesScene {
       border.position.copy(plot.position);
       border.userData.decorative = true;
       border.userData.districtBorder = true;
+      border.userData.palette = color.getHex();
       this.world.add(border);
 
       const label = this.makeDistrictLabel(district.name, color);
@@ -217,6 +231,7 @@ export class PunkCubesScene {
 
     const orderedCubes = [...layout.cubes].sort((a, b) => a.depth - b.depth);
     for (const cube of orderedCubes) this.addCube(cube);
+    this.createSwapGuide();
     this.createConnections();
     this.addParticles(layout.radius);
     this.applyBeauty();
@@ -245,7 +260,7 @@ export class PunkCubesScene {
   }
 
   focusCube(cube: LayoutCube): void {
-    const target = new THREE.Vector3(cube.center.x, cube.center.y, cube.center.z);
+    const target = this.visualHomes.get(cube.node.id)?.clone() ?? new THREE.Vector3(cube.center.x, cube.center.y, cube.center.z);
     const currentDirection = this.camera.position.clone().sub(this.controls.target).normalize();
     const fallbackDirection = new THREE.Vector3(0.8, 0.65, 1).normalize();
     const direction = currentDirection.lengthSq() > 0.5 ? currentDirection : fallbackDirection;
@@ -394,6 +409,7 @@ export class PunkCubesScene {
     }
 
     this.visuals.set(cube.node.id, { cube, mesh, edges, aura, palette });
+    this.visualHomes.set(cube.node.id, mesh.position.clone());
   }
 
   private addParticles(radius: number): void {
@@ -427,6 +443,41 @@ export class PunkCubesScene {
     this.particles = new THREE.Points(geometry, material);
     this.particles.userData.decorative = true;
     this.world.add(this.particles);
+  }
+
+  private createSwapGuide(): void {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
+    const material = new THREE.LineBasicMaterial({
+      color: PALETTE[3],
+      transparent: true,
+      opacity: 0.9,
+      depthTest: false,
+      depthWrite: false,
+    });
+    this.swapGuide = new THREE.Line(geometry, material);
+    this.swapGuide.visible = false;
+    this.swapGuide.renderOrder = 8;
+    this.swapGuide.userData.decorative = true;
+    this.world.add(this.swapGuide);
+  }
+
+  private updateSwapGuide(): void {
+    if (!this.swapGuide || !this.swapSourceId || !this.swapCandidateId) {
+      if (this.swapGuide) this.swapGuide.visible = false;
+      return;
+    }
+    const source = this.visuals.get(this.swapSourceId);
+    const target = this.visuals.get(this.swapCandidateId);
+    if (!source || !target) {
+      this.swapGuide.visible = false;
+      return;
+    }
+    const positions = this.swapGuide.geometry.getAttribute('position') as THREE.BufferAttribute;
+    positions.setXYZ(0, source.mesh.position.x, source.mesh.position.y, source.mesh.position.z);
+    positions.setXYZ(1, target.mesh.position.x, target.mesh.position.y, target.mesh.position.z);
+    positions.needsUpdate = true;
+    this.swapGuide.visible = true;
   }
 
   private createConnections(): void {
@@ -486,50 +537,61 @@ export class PunkCubesScene {
   }
 
   private applyBeauty(): void {
-    this.bloom.strength = 0.03 + this.beauty * 0.72;
-    this.bloom.radius = 0.18 + this.beauty * 0.5;
-    this.bloom.threshold = 0.96 - this.beauty * 0.16;
-    this.renderer.toneMappingExposure = 0.98 + this.beauty * 0.58;
+    const audacity = this.beauty ** 1.35;
+    this.bloom.strength = 0.14 + audacity * 0.24;
+    this.bloom.radius = 0.28 + audacity * 0.18;
+    this.bloom.threshold = 0.9 - audacity * 0.05;
+    // Beauty changes the visual language, not the scene's overall exposure.
+    this.renderer.toneMappingExposure = 1.34;
 
     const fog = this.scene.fog;
-    const background = new THREE.Color(0x08090b).lerp(new THREE.Color(0x100817), this.beauty);
+    const background = new THREE.Color(0x08090b).lerp(new THREE.Color(0x0e0914), audacity);
     if (this.scene.background instanceof THREE.Color) this.scene.background.copy(background);
     if (fog instanceof THREE.FogExp2) {
       fog.color.copy(background);
-      fog.density = 0.007 - this.beauty * 0.0035;
+      fog.density = 0.0052;
     }
     this.scene.traverse((object) => {
       if (object instanceof THREE.PointLight && object.userData.beautyLight === true) {
-        object.intensity = (object.color.getHex() === PALETTE[0] ? 36 : 30) * (0.12 + this.beauty * 1.08);
+        object.intensity = object.color.getHex() === PALETTE[0] ? 32 : 27;
       }
       if (object instanceof THREE.Mesh && object.userData.districtFloor === true) {
-        (object.material as THREE.MeshBasicMaterial).opacity = 0.025 + this.beauty * 0.13;
+        const material = object.material as THREE.MeshBasicMaterial;
+        material.color.copy(new THREE.Color(0x252a31).lerp(new THREE.Color(Number(object.userData.palette)), audacity));
+        material.opacity = 0.055 + audacity * 0.05;
       }
       if (object instanceof THREE.LineSegments && object.userData.districtBorder === true) {
-        (object.material as THREE.LineBasicMaterial).opacity = 0.08 + this.beauty * 0.28;
+        const material = object.material as THREE.LineBasicMaterial;
+        material.color.copy(new THREE.Color(0x4c535d).lerp(new THREE.Color(Number(object.userData.palette)), audacity));
+        material.opacity = 0.14 + audacity * 0.16;
       }
     });
     if (this.particles) {
       const material = this.particles.material as THREE.PointsMaterial;
-      material.opacity = this.beauty * 0.42;
-      material.size = 0.025 + this.beauty * 0.05;
+      material.opacity = 0.08 + audacity * 0.28;
+      material.size = 0.035 + audacity * 0.035;
     }
-    if (this.connections) this.connections.material.opacity = 0.12 + this.beauty * 0.48;
+    if (this.connections) this.connections.material.opacity = 0.28 + audacity * 0.18;
     for (const visual of this.visuals.values()) {
       const material = visual.mesh.material;
       const isVariable = visual.cube.node.kind === 'variable';
-      const chroma = isVariable ? 0.28 + this.beauty * 0.34 : 0.025 + this.beauty * 0.2;
+      const chroma = isVariable ? 0.2 + audacity * 0.6 : 0.035 + audacity * 0.52;
       material.color.copy(new THREE.Color(BASE_COLORS[visual.cube.node.kind]).lerp(visual.palette, chroma));
-      material.roughness = THREE.MathUtils.lerp(isVariable ? 0.48 : 0.78, isVariable ? 0.18 : 0.34, this.beauty);
-      material.metalness = THREE.MathUtils.lerp(isVariable ? 0.08 : 0.02, isVariable ? 0.46 : 0.28, this.beauty);
-      material.clearcoat = THREE.MathUtils.lerp(0.05, isVariable ? 0.92 : 0.58, this.beauty);
-      if (visual.edges) visual.edges.material.color.copy(new THREE.Color(0x7d858d).lerp(visual.palette, this.beauty * 0.7));
+      material.roughness = THREE.MathUtils.lerp(isVariable ? 0.52 : 0.82, isVariable ? 0.15 : 0.29, audacity);
+      material.metalness = THREE.MathUtils.lerp(isVariable ? 0.04 : 0.01, isVariable ? 0.52 : 0.34, audacity);
+      material.clearcoat = THREE.MathUtils.lerp(0.02, isVariable ? 0.96 : 0.7, audacity);
+      material.clearcoatRoughness = THREE.MathUtils.lerp(0.5, 0.16, audacity);
+      if (visual.edges) {
+        const loudEdge = visual.palette.clone().offsetHSL(0.06, 0.08, 0.08);
+        visual.edges.material.color.copy(new THREE.Color(0x707984).lerp(loudEdge, audacity));
+      }
     }
     this.updateActiveBranch();
   }
 
   private updateActiveBranch(): void {
     const activeId = this.hoveredId ?? this.selectedId;
+    const audacity = this.beauty ** 1.35;
     const activeIds = new Set<string>();
     if (activeId) {
       let current: CubeVisual | undefined = this.visuals.get(activeId);
@@ -552,26 +614,49 @@ export class PunkCubesScene {
     for (const visual of this.visuals.values()) {
       const isActive = activeIds.has(visual.cube.node.id);
       const isDirect = visual.cube.node.id === activeId;
+      const isSwapSource = visual.cube.node.id === this.swapSourceId;
+      const isSwapTarget = visual.cube.node.id === this.swapCandidateId;
       const kind = visual.cube.node.kind;
       const base = new THREE.Color(BASE_COLORS[kind]).lerp(
         visual.palette,
-        kind === 'variable' ? 0.28 + this.beauty * 0.34 : 0.025 + this.beauty * 0.2,
+        kind === 'variable' ? 0.2 + audacity * 0.6 : 0.035 + audacity * 0.52,
       );
-      visual.mesh.material.color.copy(isActive ? base.clone().lerp(visual.palette, 0.5 + this.beauty * 0.35) : base);
-      visual.mesh.material.emissiveIntensity = isDirect
-        ? 0.25 + this.beauty * 1.35
+      const swapColor = new THREE.Color(isSwapTarget ? PALETTE[3] : PALETTE[0]);
+      visual.mesh.material.color.copy(
+        isSwapSource || isSwapTarget
+          ? base.clone().lerp(swapColor, 0.58 + audacity * 0.22)
+          : isActive
+            ? base.clone().lerp(visual.palette, 0.44 + audacity * 0.36)
+            : base,
+      );
+      visual.mesh.material.emissive.copy(isSwapSource || isSwapTarget ? swapColor : visual.palette);
+      visual.mesh.material.emissiveIntensity = isSwapSource || isSwapTarget
+        ? 0.72 + audacity * 0.46
+        : isDirect
+          ? 0.25 + audacity * 0.9
         : isActive
-          ? 0.08 + this.beauty * 0.38
+          ? 0.08 + audacity * 0.28
           : kind === 'variable'
-            ? 0.12 + this.beauty * 0.1
+            ? 0.12 + audacity * 0.08
             : kind === 'function'
               ? 0.045
               : 0.022;
       const isAncestor = isActive && !isDirect && this.isAncestorOf(visual.cube.node.id, activeId);
-      if (kind === 'file') visual.mesh.material.opacity = isAncestor ? 0.045 : 0.1 + this.beauty * 0.24;
-      if (kind === 'function') visual.mesh.material.opacity = isAncestor ? 0.11 : 0.24 + this.beauty * 0.28;
-      if (visual.edges) visual.edges.material.opacity = isDirect ? 0.98 : kind === 'file' ? 0.5 + this.beauty * 0.36 : 0.38 + this.beauty * 0.36;
-      if (visual.aura) visual.aura.material.opacity = isDirect ? 0.015 + this.beauty * 0.1 : 0;
+      if (kind === 'file') visual.mesh.material.opacity = isAncestor ? 0.045 : 0.17 + audacity * 0.1;
+      if (kind === 'function') visual.mesh.material.opacity = isAncestor ? 0.11 : 0.34 + audacity * 0.12;
+      if (visual.edges) {
+        const loudEdge = visual.palette.clone().offsetHSL(0.06, 0.08, 0.08);
+        visual.edges.material.color.copy(
+          isSwapSource || isSwapTarget
+            ? swapColor
+            : new THREE.Color(0x707984).lerp(loudEdge, audacity),
+        );
+        visual.edges.material.opacity = isSwapSource || isSwapTarget ? 1 : isDirect ? 0.98 : kind === 'file' ? 0.58 + audacity * 0.18 : 0.48 + audacity * 0.18;
+      }
+      if (visual.aura) {
+        visual.aura.material.color.copy(isSwapSource || isSwapTarget ? swapColor : visual.palette);
+        visual.aura.material.opacity = isSwapSource || isSwapTarget ? 0.12 + audacity * 0.1 : isDirect ? 0.015 + audacity * 0.08 : 0;
+      }
     }
   }
 
@@ -582,18 +667,24 @@ export class PunkCubesScene {
       if (object instanceof THREE.Sprite) {
         object.material.map?.dispose();
         object.material.dispose();
-      } else if (object instanceof THREE.Mesh || object instanceof THREE.LineSegments || object instanceof THREE.Points) {
+      } else if (object instanceof THREE.Mesh || object instanceof THREE.Line || object instanceof THREE.LineSegments || object instanceof THREE.Points) {
         object.geometry.dispose();
         const materials = Array.isArray(object.material) ? object.material : [object.material];
         for (const material of materials) material.dispose();
       }
     }
     this.visuals.clear();
+    this.visualHomes.clear();
     this.pickables.length = 0;
     this.particles = null;
     this.connections = null;
+    this.swapGuide = null;
     this.connectionData = [];
-    this.settle = null;
+    this.settles.clear();
+    this.swapSourceId = null;
+    this.swapCandidateId = null;
+    this.swapCueUntil = 0;
+    this.callbacks.onSwapPreview(null, null, 'idle');
     this.hoveredId = null;
     this.selectedId = null;
   }
@@ -678,6 +769,106 @@ export class PunkCubesScene {
       .map((visual) => visual.cube.node.id);
   }
 
+  private swapSlotFor(visual: CubeVisual): SwapSlot {
+    const home = this.visualHomes.get(visual.cube.node.id) ?? visual.mesh.position;
+    return {
+      id: visual.cube.node.id,
+      parentId: visual.cube.parentId,
+      district: visual.cube.district,
+      kind: visual.cube.node.kind,
+      size: visual.cube.size,
+      position: home,
+    };
+  }
+
+  private findSwapCandidate(drag: DragState, position: THREE.Vector3): CubeVisual | null {
+    const source = this.visuals.get(drag.rootId);
+    if (!source) return null;
+    const sourceSlot = this.swapSlotFor(source);
+    const directHit = this.raycaster.intersectObjects(drag.candidatePickables, false)[0];
+    const directVisual = directHit ? this.visuals.get(String(directHit.object.userData.cubeId)) ?? null : null;
+    if (directVisual) return directVisual;
+    const candidate = pickSwapSlot(sourceSlot, drag.compatibleSlots, position);
+    return candidate ? this.visuals.get(candidate.id) ?? null : null;
+  }
+
+  private setSwapCandidate(drag: DragState, candidate: CubeVisual | null): void {
+    const candidateId = candidate?.cube.node.id ?? null;
+    if (drag.candidateId === candidateId) return;
+    drag.candidateId = candidateId;
+    this.swapSourceId = drag.rootId;
+    this.swapCandidateId = candidateId;
+    this.updateSwapGuide();
+    this.updateActiveBranch();
+    const source = this.visuals.get(drag.rootId)?.cube ?? null;
+    this.callbacks.onSwapPreview(source, candidate?.cube ?? null, candidate ? 'ready' : 'seeking');
+  }
+
+  private clearSwapCue(notify = true): void {
+    this.swapSourceId = null;
+    this.swapCandidateId = null;
+    this.swapCueUntil = 0;
+    if (this.swapGuide) this.swapGuide.visible = false;
+    this.updateActiveBranch();
+    if (notify) this.callbacks.onSwapPreview(null, null, 'idle');
+  }
+
+  private shiftVisualHomes(ids: readonly string[], offset: THREE.Vector3): void {
+    for (const id of ids) this.visualHomes.get(id)?.add(offset);
+  }
+
+  private commitVisualSwap(drag: DragState, target: CubeVisual): void {
+    const source = this.visuals.get(drag.rootId);
+    const targetHome = this.visualHomes.get(target.cube.node.id)?.clone();
+    if (!source || !targetHome) return;
+
+    const sourceIds = drag.subtreeIds;
+    const targetIds = this.subtreeIds(target.cube.node.id);
+    const sourcePosition = source.mesh.position.clone();
+    const targetPosition = target.mesh.position.clone();
+    const sourceToTarget = targetHome.clone().sub(drag.rootHome);
+    const targetToSource = drag.rootHome.clone().sub(targetHome);
+    this.shiftVisualHomes(sourceIds, sourceToTarget);
+    this.shiftVisualHomes(targetIds, targetToSource);
+
+    const sourceHome = this.visualHomes.get(source.cube.node.id)!.clone();
+    const mappedTargetHome = this.visualHomes.get(target.cube.node.id)!.clone();
+    this.callbacks.onSwapPreview(source.cube, target.cube, 'committed');
+    this.swapCueUntil = performance.now() + 1100;
+
+    if (this.reducedMotion) {
+      this.applySubtreeOffset(sourceIds, sourceHome, sourceHome, false);
+      this.applySubtreeOffset(targetIds, mappedTargetHome, mappedTargetHome, false);
+      source.mesh.quaternion.copy(this.identityQuaternion);
+      target.mesh.quaternion.copy(this.identityQuaternion);
+      this.syncAttachments(source);
+      this.syncAttachments(target);
+      this.updateConnections();
+      return;
+    }
+
+    this.settles.set(source.cube.node.id, {
+      rootId: source.cube.node.id,
+      subtreeIds: sourceIds,
+      rootHome: sourceHome,
+      position: sourcePosition,
+      velocity: drag.velocity.clone().clampLength(0, 18),
+      tilt: new THREE.Vector2(source.mesh.rotation.x, source.mesh.rotation.z),
+      tiltVelocity: new THREE.Vector2(),
+      flash: 1,
+    });
+    this.settles.set(target.cube.node.id, {
+      rootId: target.cube.node.id,
+      subtreeIds: targetIds,
+      rootHome: mappedTargetHome,
+      position: targetPosition,
+      velocity: drag.velocity.clone().multiplyScalar(-0.22).clampLength(0, 8),
+      tilt: new THREE.Vector2(),
+      tiltVelocity: new THREE.Vector2(),
+      flash: 0.7,
+    });
+  }
+
   private syncAttachments(visual: CubeVisual): void {
     if (visual.edges) {
       visual.edges.position.copy(visual.mesh.position);
@@ -689,15 +880,17 @@ export class PunkCubesScene {
     }
   }
 
-  private applySubtreeOffset(ids: readonly string[], rootHome: THREE.Vector3, rootPosition: THREE.Vector3): void {
-    const offset = rootPosition.clone().sub(rootHome);
+  private applySubtreeOffset(ids: readonly string[], rootHome: THREE.Vector3, rootPosition: THREE.Vector3, refreshConnections = true): void {
+    this.subtreeOffset.subVectors(rootPosition, rootHome);
     for (const id of ids) {
       const visual = this.visuals.get(id);
       if (!visual) continue;
-      visual.mesh.position.set(visual.cube.center.x + offset.x, visual.cube.center.y + offset.y, visual.cube.center.z + offset.z);
+      const home = this.visualHomes.get(id);
+      if (!home) continue;
+      visual.mesh.position.copy(home).add(this.subtreeOffset);
       this.syncAttachments(visual);
     }
-    this.updateConnections();
+    if (refreshConnections) this.updateConnections();
   }
 
   private setRootTilt(rootId: string, tilt: THREE.Vector2): void {
@@ -707,23 +900,22 @@ export class PunkCubesScene {
     this.syncAttachments(visual);
   }
 
-  private cancelSettle(nextRootId: string): void {
-    const settle = this.settle;
-    if (!settle) return;
-    const visual = this.visuals.get(settle.rootId);
-    // Regrabbing the same root preserves its in-flight position and tilt; it
-    // feels interruptible rather than teleporting through the hand. A new
-    // root, however, must first return the older subtree exactly home.
-    if (settle.rootId !== nextRootId) {
-      this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome);
-      if (visual) {
-        visual.mesh.quaternion.copy(this.identityQuaternion);
-        this.syncAttachments(visual);
-        if (visual.aura) visual.aura.material.opacity = 0;
+  private cancelSettles(nextRootId: string): void {
+    for (const settle of this.settles.values()) {
+      const visual = this.visuals.get(settle.rootId);
+      // Regrabbing the same root preserves its in-flight pose. Other mapping
+      // moves finish before a new gesture takes ownership.
+      if (settle.rootId !== nextRootId) {
+        this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome, false);
+        if (visual) {
+          visual.mesh.quaternion.copy(this.identityQuaternion);
+          this.syncAttachments(visual);
+          if (visual.aura) visual.aura.material.opacity = 0;
+        }
       }
-      this.updateConnections();
     }
-    this.settle = null;
+    this.settles.clear();
+    this.updateConnections();
   }
 
   private releaseCubeGesture(): void {
@@ -737,17 +929,24 @@ export class PunkCubesScene {
   }
 
   private beginDrag(event: PointerEvent, picked: { visual: CubeVisual; point: THREE.Vector3 }): void {
-    this.cancelSettle(picked.visual.cube.node.id);
+    this.cancelSettles(picked.visual.cube.node.id);
     this.cameraTween = null;
     const root = picked.visual;
     this.camera.getWorldDirection(this.cameraDirection);
     const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(this.cameraDirection, picked.point);
-    const rootHome = new THREE.Vector3(root.cube.center.x, root.cube.center.y, root.cube.center.z);
+    const rootHome = this.visualHomes.get(root.cube.node.id)?.clone()
+      ?? new THREE.Vector3(root.cube.center.x, root.cube.center.y, root.cube.center.z);
     const rootStart = root.mesh.position.clone();
+    const sourceSlot = this.swapSlotFor(root);
+    const compatibleVisuals = [...this.visuals.values()].filter((visual) => (
+      areSwapCompatible(sourceSlot, this.swapSlotFor(visual))
+    ));
     this.drag = {
       pointerId: event.pointerId,
       rootId: root.cube.node.id,
       subtreeIds: this.subtreeIds(root.cube.node.id),
+      compatibleSlots: compatibleVisuals.map((visual) => this.swapSlotFor(visual)),
+      candidatePickables: compatibleVisuals.map((visual) => visual.mesh),
       plane,
       grabOffset: rootStart.clone().sub(picked.point),
       rootHome,
@@ -756,7 +955,14 @@ export class PunkCubesScene {
       lastTime: performance.now(),
       velocity: new THREE.Vector3(),
       moved: false,
+      candidateId: null,
     };
+    this.swapSourceId = root.cube.node.id;
+    this.swapCandidateId = null;
+    this.swapCueUntil = 0;
+    this.callbacks.onHover(null, null);
+    this.callbacks.onSwapPreview(root.cube, null, 'seeking');
+    this.updateActiveBranch();
     this.controls.enabled = false;
     this.renderer.domElement.setPointerCapture(event.pointerId);
     this.renderer.domElement.style.cursor = 'grabbing';
@@ -768,13 +974,14 @@ export class PunkCubesScene {
     this.updatePointer(event);
     if (!this.raycaster.ray.intersectPlane(drag.plane, this.dragPoint)) return;
     const now = performance.now();
-    const nextRoot = this.dragPoint.clone().add(drag.grabOffset);
+    const nextRoot = this.dragRootPosition.copy(this.dragPoint).add(drag.grabOffset);
     const dt = Math.min(Math.max((now - drag.lastTime) / 1000, 1 / 240), 1 / 20);
     drag.velocity.copy(this.dragPoint).sub(drag.lastPoint).multiplyScalar(1 / dt).clampLength(0, 34);
     drag.lastPoint.copy(this.dragPoint);
     drag.lastTime = now;
     drag.moved ||= Math.hypot(event.clientX - drag.startClient.x, event.clientY - drag.startClient.y) > (event.pointerType === 'touch' ? 9 : 5);
     this.applySubtreeOffset(drag.subtreeIds, drag.rootHome, nextRoot);
+    if (drag.moved) this.setSwapCandidate(drag, this.findSwapCandidate(drag, nextRoot));
     // Velocity tilts only the grabbed shell, bounded below six degrees.
     this.setRootTilt(
       drag.rootId,
@@ -788,10 +995,22 @@ export class PunkCubesScene {
   private endDrag(cancelled: boolean): void {
     const drag = this.drag;
     if (!drag) return;
+    const target = drag.candidateId ? this.visuals.get(drag.candidateId) ?? null : null;
     this.releaseCubeGesture();
     const visual = this.visuals.get(drag.rootId);
-    if (!visual) return;
-    if (!cancelled && !drag.moved) this.focusCube(visual.cube);
+    if (!visual) {
+      this.clearSwapCue();
+      return;
+    }
+    if (!cancelled && !drag.moved) {
+      this.focusCube(visual.cube);
+    }
+    if (!cancelled && drag.moved && target) {
+      this.commitVisualSwap(drag, target);
+      this.updateActiveBranch();
+      return;
+    }
+    this.clearSwapCue();
     if (this.reducedMotion) {
       this.applySubtreeOffset(drag.subtreeIds, drag.rootHome, drag.rootHome);
       visual.mesh.quaternion.copy(this.identityQuaternion);
@@ -799,7 +1018,7 @@ export class PunkCubesScene {
       this.updateConnections();
       return;
     }
-    this.settle = {
+    this.settles.set(drag.rootId, {
       rootId: drag.rootId,
       subtreeIds: drag.subtreeIds,
       rootHome: drag.rootHome,
@@ -808,7 +1027,7 @@ export class PunkCubesScene {
       tilt: new THREE.Vector2(visual.mesh.rotation.x, visual.mesh.rotation.z),
       tiltVelocity: new THREE.Vector2(),
       flash: 1,
-    };
+    });
   }
 
   private readonly onPointerMove = (event: PointerEvent): void => {
@@ -928,18 +1147,21 @@ export class PunkCubesScene {
       if (aura) aura.scale.setScalar(1.035 + Math.sin(elapsed * 2.1) * 0.008 * this.beauty);
     }
 
-    if (this.settle) this.advanceSettle(dt);
+    if (this.settles.size > 0) {
+      for (const settle of [...this.settles.values()]) this.advanceSettle(settle, dt);
+      this.updateConnections();
+    }
+    if (this.swapSourceId && this.swapCandidateId) this.updateSwapGuide();
+    if (!this.drag && this.swapCueUntil > 0 && now >= this.swapCueUntil) this.clearSwapCue();
 
     this.controls.update();
     this.composer.render();
   };
 
-  private advanceSettle(dt: number): void {
-    const settle = this.settle;
-    if (!settle) return;
+  private advanceSettle(settle: SettleState, dt: number): void {
     const root = this.visuals.get(settle.rootId);
     if (!root) {
-      this.settle = null;
+      this.settles.delete(settle.rootId);
       return;
     }
     // Fixed substeps make tab-resume and low-frame-rate interaction behave
@@ -958,7 +1180,7 @@ export class PunkCubesScene {
       settle.tilt.set(tiltX.value, tiltZ.value);
       settle.tiltVelocity.set(tiltX.velocity, tiltZ.velocity);
     }
-    this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.position);
+    this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.position, false);
     this.setRootTilt(settle.rootId, settle.tilt);
     settle.flash = Math.max(0, settle.flash - dt * 2.4);
     if (root.aura) root.aura.material.opacity = (0.02 + settle.flash * 0.13) * this.beauty;
@@ -972,24 +1194,24 @@ export class PunkCubesScene {
       settle.tilt.length() < 0.002 &&
       settle.tiltVelocity.length() < 0.015
     ) {
-      this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome);
+      this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome, false);
       root.mesh.quaternion.copy(this.identityQuaternion);
       this.syncAttachments(root);
-      this.settle = null;
+      this.settles.delete(settle.rootId);
     }
   }
 
   private finishSettleImmediately(): void {
-    const settle = this.settle;
-    if (!settle) return;
-    const root = this.visuals.get(settle.rootId);
-    this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome);
-    if (root) {
-      root.mesh.quaternion.copy(this.identityQuaternion);
-      this.syncAttachments(root);
-      if (root.aura) root.aura.material.opacity = 0;
+    for (const settle of this.settles.values()) {
+      const root = this.visuals.get(settle.rootId);
+      this.applySubtreeOffset(settle.subtreeIds, settle.rootHome, settle.rootHome, false);
+      if (root) {
+        root.mesh.quaternion.copy(this.identityQuaternion);
+        this.syncAttachments(root);
+        if (root.aura) root.aura.material.opacity = 0;
+      }
     }
     this.updateConnections();
-    this.settle = null;
+    this.settles.clear();
   }
 }

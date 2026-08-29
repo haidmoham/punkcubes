@@ -43,7 +43,7 @@ app.innerHTML = `
     </header>
 
     <section class="viewport" aria-label="interactive codebase visualization">
-      <canvas id="scene" tabindex="0" aria-label="3d repository hierarchy. primary drag on a cube moves it; drag empty space or right-drag anywhere orbits the camera; middle/wheel zooms; click inspects."></canvas>
+      <canvas id="scene" tabindex="0" aria-label="3d repository hierarchy. drag a cube onto a highlighted sibling to swap their visual mapping; drag empty space or right-drag anywhere to orbit; middle or wheel zooms; click inspects."></canvas>
 
       <div class="scene-meta" aria-live="polite">
         <span class="live-dot"></span>
@@ -85,6 +85,8 @@ app.innerHTML = `
 
       <div class="hover-label" id="hover-label" hidden></div>
 
+      <aside class="swap-pane" id="swap-pane" aria-live="polite" hidden></aside>
+
       <div class="scene-tools">
         <button type="button" id="home-button" title="reset camera (h)">
           <span aria-hidden="true">⌂</span><span>whole repo</span>
@@ -105,7 +107,7 @@ app.innerHTML = `
     </section>
 
     <footer class="footer-note">
-      <span>primary drag on cube: move it · empty space or right-drag anywhere: orbit camera · middle/wheel: zoom · click: inspect</span>
+      <span>drag cube onto a highlighted sibling: swap mapping · empty space or right-drag: orbit · middle/wheel: zoom · click: inspect</span>
       <span>no overlaps</span>
     </footer>
   </main>
@@ -133,6 +135,7 @@ const elements = {
   summaryStats: required<HTMLElement>('#summary-stats'),
   inspector: required<HTMLElement>('#inspector'),
   hover: required<HTMLElement>('#hover-label'),
+  swapPane: required<HTMLElement>('#swap-pane'),
   home: required<HTMLButtonElement>('#home-button'),
   connections: required<HTMLButtonElement>('#connections-button'),
   connectionsLabel: required<HTMLElement>('#connections-label'),
@@ -146,6 +149,7 @@ let connectionsVisible = true;
 const scene = new PunkCubesScene(elements.canvas, {
   onHover: renderHover,
   onSelect: renderInspector,
+  onSwapPreview: renderSwapPreview,
 });
 
 elements.form.addEventListener('submit', (event) => {
@@ -157,7 +161,7 @@ elements.beauty.addEventListener('input', () => {
   const value = Number(elements.beauty.value);
   elements.beautyValue.value = String(value);
   scene.setBeauty(value / 100);
-  document.documentElement.style.setProperty('--beauty', String(value / 100));
+  setBeautyPresentation(value / 100);
   updateUrl();
 });
 
@@ -184,7 +188,7 @@ elements.input.value = initialRepo;
 elements.beauty.value = String(initialBeauty);
 elements.beautyValue.value = String(initialBeauty);
 scene.setBeauty(initialBeauty / 100);
-document.documentElement.style.setProperty('--beauty', String(initialBeauty / 100));
+setBeautyPresentation(initialBeauty / 100);
 setConnectionsVisible(initialConnectionsVisible);
 void visualize(initialRepo);
 
@@ -271,6 +275,40 @@ function renderHover(cube: LayoutCube | null, point: { x: number; y: number } | 
   elements.hover.style.top = `${Math.min(point.y + 18, window.innerHeight - height - padding)}px`;
 }
 
+function renderSwapPreview(
+  source: LayoutCube | null,
+  target: LayoutCube | null,
+  state: 'idle' | 'seeking' | 'ready' | 'committed',
+): void {
+  if (!source || state === 'idle') {
+    elements.swapPane.hidden = true;
+    return;
+  }
+  elements.swapPane.hidden = false;
+  elements.swapPane.dataset.state = state;
+  const status = state === 'committed'
+    ? 'mapped · code stays untouched'
+    : target
+      ? 'release to swap slots · visual only'
+      : 'drag over a sibling cube of the same kind';
+  elements.swapPane.innerHTML = `
+    <div class="swap-pane-head">
+      <span>${state === 'committed' ? 'mapping updated' : 'mapping swap'}</span>
+      <i>${state === 'ready' ? 'armed' : state === 'committed' ? 'done' : 'seeking'}</i>
+    </div>
+    <div class="swap-pair">
+      ${swapNodeMarkup(source, 'held')}
+      <b aria-hidden="true">⇄</b>
+      ${target ? swapNodeMarkup(target, 'target') : '<span class="swap-empty">compatible<br />sibling</span>'}
+    </div>
+    <small>${status}</small>
+  `;
+}
+
+function swapNodeMarkup(cube: LayoutCube, label: string): string {
+  return `<span class="swap-node ${cube.node.kind}"><i>${label} · ${cube.node.kind}</i><strong>${escapeHtml(cube.node.name)}</strong><em>${cube.node.lines} lines</em></span>`;
+}
+
 function renderInspector(cube: LayoutCube | null): void {
   if (!cube) {
     elements.inspector.innerHTML = `
@@ -336,6 +374,12 @@ function setConnectionsVisible(visible: boolean): void {
   elements.connections.setAttribute('aria-label', `${visible ? 'hide' : 'show'} parent-child weighted connections`);
   elements.connectionsLabel.textContent = `connections: ${visible ? 'on' : 'off'}`;
   updateUrl();
+}
+
+function setBeautyPresentation(value: number): void {
+  const audacity = value ** 1.35;
+  document.documentElement.style.setProperty('--beauty', String(value));
+  document.documentElement.style.setProperty('--audacity', String(audacity));
 }
 
 function required<T extends Element>(selector: string): T {
