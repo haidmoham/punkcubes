@@ -14,6 +14,7 @@ if (!app) throw new Error('missing #app mount point.');
 app.innerHTML = `
   <main class="app-shell">
     <header class="topbar">
+      <div class="brand-group">
       <a class="brand" href="/" aria-label="punkcubes home">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
         <span>
@@ -21,6 +22,8 @@ app.innerHTML = `
           <small>code, stacked properly</small>
         </span>
       </a>
+      <a class="cluster-return" href="https://shin86.dev/"><span aria-hidden="true">←</span> shin86.dev</a>
+      </div>
 
       <form class="repo-form" id="repo-form">
         <label for="repo-input">github repo</label>

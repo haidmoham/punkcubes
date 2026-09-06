@@ -17,6 +17,10 @@ npm run dev
 
 Use `npm run check` for tests, type-checking, and the production build.
 
+Keep a visible lowercase return link to `https://shin86.dev/` in the topbar.
+The link returns to the cluster hub. The brand link returns to this app.
+Use acid accents and squared edges for control feedback. Keep keyboard focus visible.
+
 ## Design lineage
 
 The layout borrows semantic hierarchy from

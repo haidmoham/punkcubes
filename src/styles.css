@@ -1091,3 +1091,46 @@ a:active {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* Acid edges identify actions while the archive retains its dark framing. */
+.brand-group { display: grid; gap: 8px; justify-items: start; }
+.cluster-return {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid #b6ff4a80;
+  color: var(--acid);
+  background: #b6ff4a0d;
+  font: 400 10px/1 'DM Mono', monospace;
+  text-decoration: none;
+  transition: background-color 160ms ease, color 160ms ease, transform 120ms var(--ease-out);
+}
+.scene-tools button, .scene-tools a, .inspect-source {
+  border-color: #ffffff45;
+  color: #c0c6cd;
+}
+.scene-tools #connections-button[aria-pressed='true'] {
+  border-color: #b6ff4a9c;
+  background: #b6ff4a18;
+  color: var(--acid);
+  box-shadow: inset 0 -2px var(--acid);
+}
+.close-inspector { border: 1px solid #ffffff45; color: #c0c6cd; }
+@media (hover: hover) {
+  .cluster-return:hover { color: var(--ink); background: var(--acid); }
+  .scene-tools button:hover, .scene-tools a:hover, .inspect-source:hover,
+  .close-inspector:hover {
+    border-color: var(--acid);
+    color: var(--acid);
+    background: #b6ff4a20;
+    box-shadow: inset 0 0 0 1px var(--acid);
+  }
+  .repo-field button:hover, .error-card button:hover {
+    box-shadow: 0 0 0 2px var(--ink), 0 0 0 3px var(--acid);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cluster-return { transition: none; }
+}
