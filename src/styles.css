@@ -1134,3 +1134,5 @@ a:active {
 @media (prefers-reduced-motion: reduce) {
   .cluster-return { transition: none; }
 }
+
+.footer-note{display:flex;height:78px;gap:12px}.footer-note .signature-placement{flex:none}@media(max-width:700px){.footer-note{padding:0 12px}.footer-note>span{font-size:7px}}
