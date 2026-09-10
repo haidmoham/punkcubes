@@ -1136,3 +1136,6 @@ a:active {
 }
 
 .footer-note{display:flex;height:78px;gap:12px}.footer-note .signature-placement{flex:none}@media(max-width:700px){.footer-note{display:flex;padding:0 12px}.footer-note>span{font-size:7px}}
+
+.footer-note .community-link { flex-shrink: 0; text-transform: none; }
+@media (max-width: 700px) { .footer-note > span { display: none; } }

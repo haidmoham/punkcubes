@@ -110,6 +110,7 @@ app.innerHTML = `
     </section>
 
     <footer class="footer-note">
+      <a class="cluster-return community-link" href="https://discord.gg/Xy4Aq8eRZ" target="_blank" rel="noopener noreferrer">Egghead Island ↗</a>
       <span>drag cube onto a highlighted sibling: swap mapping · empty space or right-drag: orbit · middle/wheel: zoom · click: inspect</span>
       <span>no overlaps</span>
     </footer>
