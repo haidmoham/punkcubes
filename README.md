@@ -8,6 +8,14 @@ The hierarchy never moves with the `beauty` control. Beauty scales atmosphere
 only—color, aura, depth, and low-amplitude motion—so the tool remains legible at
 every setting.
 
+**[Open Punkcubes](https://punkcubes.shin86.dev)**
+
+## Scope
+
+The browser resolves the public repository’s default branch to a commit before fetching files. JavaScript/TypeScript symbols use the TypeScript parser; Python, CSS, and HTML use limited regular-expression extraction. Other formats retain file-level structure. This is a bounded structural view, not whole-program semantic analysis or a complete call graph.
+
+Loading is unauthenticated and subject to GitHub rate limits. It selects at most 180 files, 300,000 bytes per file, and 5,000,000 bytes in total; unreadable files can be skipped. Large repositories are partial views. The current default branch is `codex/punkcubes-one-shot`; use the repository default when cloning.
+
 ## Run
 
 ```sh
